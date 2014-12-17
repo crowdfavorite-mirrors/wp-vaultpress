@@ -3,7 +3,7 @@
  * Plugin Name: VaultPress
  * Plugin URI: http://vaultpress.com/?utm_source=plugin-uri&amp;utm_medium=plugin-description&amp;utm_campaign=1.0
  * Description: Protect your content, themes, plugins, and settings with <strong>realtime backup</strong> and <strong>automated security scanning</strong> from <a href="http://vaultpress.com/?utm_source=wp-admin&amp;utm_medium=plugin-description&amp;utm_campaign=1.0" rel="nofollow">VaultPress</a>. Activate, enter your registration key, and never worry again. <a href="http://vaultpress.com/help/?utm_source=wp-admin&amp;utm_medium=plugin-description&amp;utm_campaign=1.0" rel="nofollow">Need some help?</a>
- * Version: 1.6.3
+ * Version: 1.6.8
  * Author: Automattic
  * Author URI: http://vaultpress.com/?utm_source=author-uri&amp;utm_medium=plugin-description&amp;utm_campaign=1.0
  * License: GPL2+
@@ -17,8 +17,8 @@ if ( !defined( 'ABSPATH' ) )
 
 class VaultPress {
 	var $option_name    = 'vaultpress';
-	var $db_version     = 3;
-	var $plugin_version = '1.6.3';
+	var $db_version     = 4;
+	var $plugin_version = '1.6.8';
 
 	function __construct() {
 		register_activation_hook( __FILE__, array( $this, 'activate' ) );
@@ -33,7 +33,7 @@ class VaultPress {
 			'key'                   => '',
 			'secret'                => '',
 			'connection'            => false,
-			'service_ips'           => false
+			'service_ips_cidr'      => false
 		);
 
 		$this->options = wp_parse_args( $options, $defaults );
@@ -61,6 +61,29 @@ class VaultPress {
 		}
 
 		return $instance;
+	}
+	
+	static function register( $registration_key ) {
+		$vp = self::init();
+		
+		$nonce = wp_create_nonce( 'vp_register_' . $registration_key );
+		$args = array( 'registration_key' =>  $registration_key, 'nonce' => $nonce );
+		$response = $vp->contact_service( 'register', $args );
+
+		// Check for an error
+		if ( ! empty( $response['faultCode'] ) )
+			return new WP_Error( $response['faultCode'], $response['faultString'] );
+		
+		// Validate result
+		if ( empty( $response['key'] ) || empty( $response['secret'] ) || empty( $response['nonce'] ) || $nonce != $response['nonce'] )
+			return new WP_Error( 1, __( 'There was a problem trying to register your VaultPress subscription.' ) );
+		
+		// Store the result, force a connection test.
+		$vp->update_option( 'key', $response['key'] );
+		$vp->update_option( 'secret', $response['secret'] );
+		$vp->check_connection( true );
+
+		return true;
 	}
 
 	function activate( $network_wide ) {
@@ -113,6 +136,12 @@ class VaultPress {
 		}
 
 		if ( $current_db_version < 3 ) {
+			$this->update_firewall();
+			$this->update_option( 'db_version', $this->db_version );
+			$this->clear_connection();
+		}
+		
+		if ( $current_db_version < 4 ) {
 			$this->update_firewall();
 			$this->update_option( 'db_version', $this->db_version );
 			$this->clear_connection();
@@ -946,35 +975,39 @@ class VaultPress {
 		$data = false;
 		$https_error = null;
 		$retry = 2;
+		$protocol = 'https'; 
 		do {
 			$retry--;
-			$protocol = 'http'; 
 			$args['sslverify'] = 'https' == $protocol ? true : false;
-			$r = wp_remote_get( $url=sprintf( "%s://%s/%s", $protocol, $hostname, $path ), $args );
+			$r = wp_remote_get( $url=sprintf( "%s://%s/%s?cidr_ranges=1", $protocol, $hostname, $path ), $args );
 			if ( 200 == wp_remote_retrieve_response_code( $r ) ) {
 				if ( 99 == $this->get_option( 'connection_error_code' ) )
 					$this->clear_connection();
 				$data = @unserialize( wp_remote_retrieve_body( $r ) );
 				break;
 			}
-			if ( 'https' == $protocol )
+			if ( 'https' == $protocol ) {
 				$https_error = $r;
+				$protocol = 'http';
+			}
 			usleep( 100 );
 		} while( $retry > 0 );
 
-		$r_code = wp_remote_retrieve_response_code( $https_error );
-		if ( 0 == $retry && 200 != $r_code ) {
-			$error_message = sprintf( 'Unexpected HTTP response code %s', $r_code );
-			if ( false === $r_code )
-				$error_message = 'Unable to find an HTTP transport that supports SSL verification';
-			elseif ( is_wp_error( $https_error ) )
-				$error_message = $https_error->get_error_message();
-			
-			$this->update_option( 'connection', time() );
-			$this->update_option( 'connection_error_code', 99 );
-			$this->update_option( 'connection_error_message', sprintf( __('Warning: The VaultPress plugin is using an insecure protocol because it cannot verify the identity of the VaultPress server. Please contact your hosting provider, and ask them to check that SSL certificate verification is correctly configured on this server. The request failed with the following error: "%s". If you&rsquo;re still having issues please <a href="%1$s">contact the VaultPress&nbsp;Safekeepers</a>.', 'vaultpress' ), esc_html( $error_message ), 'http://vaultpress.com/contact/' ) );
+		if ( $https_error != null && ! empty( $data ) ) {
+			$r_code = wp_remote_retrieve_response_code( $https_error );
+			if ( 200 != $r_code ) {
+				$error_message = sprintf( 'Unexpected HTTP response code %s', $r_code );
+				if ( false === $r_code )
+					$error_message = 'Unable to find an HTTP transport that supports SSL verification';
+				elseif ( is_wp_error( $https_error ) )
+					$error_message = $https_error->get_error_message();
+				
+				$this->update_option( 'connection', time() );
+				$this->update_option( 'connection_error_code', 99 );
+				$this->update_option( 'connection_error_message', sprintf( __('Warning: The VaultPress plugin is using an insecure protocol because it cannot verify the identity of the VaultPress server. Please contact your hosting provider, and ask them to check that SSL certificate verification is correctly configured on this server. The request failed with the following error: "%s". If you&rsquo;re still having issues please <a href="%1$s">contact the VaultPress&nbsp;Safekeepers</a>.', 'vaultpress' ), esc_html( $error_message ), 'http://vaultpress.com/contact/' ) );
+			}
 		}
-
+	
 		return $data;
 	}
 
@@ -982,13 +1015,13 @@ class VaultPress {
 		$data = $this->request_firewall_update();
 		if ( $data ) {
 			$newval = array( 'updated' => time(), 'data' => $data );
-			$this->update_option( 'service_ips', $newval );
+			$this->update_option( 'service_ips_cidr', $newval );
 		}
 
 		$external_data = $this->request_firewall_update( true );
 		if ( $external_data ) {
 			$external_newval = array( 'updated' => time(), 'data' => $external_data );
-			update_option( 'vaultpress_service_ips_external', $external_newval );
+			update_option( 'vaultpress_service_ips_external_cidr', $external_newval );
 		}
 
 		if ( !empty( $data ) && !empty( $external_data ) )
@@ -1755,27 +1788,7 @@ JS;
 			return false;
 		}
 		if ( !$this->get_option( 'disable_firewall' ) ) {
-			$rxs = $this->get_option( 'service_ips' );
-			$service_ips_external = get_option( 'vaultpress_service_ips_external' );
-			if ( !empty( $rxs['data'] ) && !empty( $service_ips_external['data'] ) )
-				$rxs['data'] = array_merge( $rxs['data'], $service_ips_external['data'] );
-			if ( $rxs ) {
-				$timeout = time() - 86400;
-				if ( $rxs ) {
-					if ( $rxs['updated'] < $timeout )
-						$refetch = true;
-					else
-						$refetch = false;
-					$rxs = $rxs['data'];
-				}
-			} else {
-				$refetch = true;
-			}
-			if ( $refetch ) {
-				if ( $data = $this->update_firewall() )
-					$rxs = $data;
-			}
-			if ( !$this->validate_ip_address( $rxs ) )
+			if ( ! $this->check_firewall() )
 				return false;
 		}
 		$sig = explode( ':', $sig );
@@ -1804,7 +1817,7 @@ JS;
 	function ip_in_cidr( $ip, $cidr ) {
 		list ($net, $mask) = explode( '/', $cidr );
 		return ( ip2long( $ip ) & ~((1 << (32 - $mask)) - 1) ) == ( ip2long( $net ) & ~((1 << (32 - $mask)) - 1) );
-}
+	}
 
 	function ip_in_cidrs( $ip, $cidrs ) {
 		foreach ( (array)$cidrs as $cidr ) {
@@ -1812,6 +1825,66 @@ JS;
 				return $cidr;
 			}
 		}
+		
+		return false;
+	}
+	
+	function check_firewall() {
+		global $__vp_validate_error;
+
+		$stored_cidrs = $this->get_option( 'service_ips_cidr' );
+		$stored_ext_cidrs = get_option( 'vaultpress_service_ips_external_cidr' );
+		
+		$one_day_ago = time() - 86400;
+		if ( empty( $stored_cidrs ) || empty( $stored_ext_cidrs ) || $stored_cidrs['updated'] < $one_day_ago ) {
+			$cidrs = $this->update_firewall();
+		} else {
+			$cidrs = array_merge( $stored_cidrs['data'], $stored_ext_cidrs['data'] );
+		}
+		
+		if ( empty( $cidrs ) ) {
+			//	No up-to-date info; fall back on the old methods.
+			if ( $this->do_c_block_firewall() ) {
+				return true;
+			} else {
+				$__vp_validate_error = array( 'error' => 'empty_vp_ip_cidr_range' );
+				return false;
+			}
+		}
+		
+		//	Figure out possible remote IPs		
+		if ( $this->get_option( 'allow_forwarded_for') && !empty( $_SERVER['HTTP_X_FORWARDED_FOR'] ) )
+			$remote_ips = explode( ',', $_SERVER['HTTP_X_FORWARDED_FOR'] );
+
+		if ( !empty( $_SERVER['REMOTE_ADDR'] ) )
+			$remote_ips[] = $_SERVER['REMOTE_ADDR'];
+
+		if ( empty( $remote_ips ) ) {
+			$__vp_validate_error = array( 'error' => 'no_remote_addr', 'detail' => (int) $this->get_option( 'allow_forwarded_for' ) ); // shouldn't happen
+			return false;
+		}
+		
+		foreach ( $remote_ips as $ip ) {
+			$ip = preg_replace( '#^::(ffff:)?#', '', $ip );
+			if ( $cidr = $this->ip_in_cidrs( $ip, $cidrs ) ) {
+				return true;
+			}
+		}
+		
+		$__vp_validate_error = array( 'error' => 'remote_addr_fail', 'detail' => $remote_ips );
+		return false;
+	}
+	
+	function do_c_block_firewall() {
+		//	Perform the firewall check by class-c ip blocks
+		$rxs = $this->get_option( 'service_ips' );
+		$service_ips_external = get_option( 'vaultpress_service_ips_external' );
+
+		if ( !empty( $rxs['data'] ) && !empty( $service_ips_external['data'] ) )
+			$rxs = array_merge( $rxs['data'], $service_ips_external['data'] );		
+		if ( ! $rxs )
+			return false;
+		return $this->validate_ip_address( $rxs );
 	}
 
 	function validate_ip_address( $rxs ) {
@@ -1927,6 +2000,8 @@ JS;
 		global $vaultpress_pings;
 		if ( defined( 'WP_IMPORTING' ) && constant( 'WP_IMPORTING' ) )
 			return;
+		if ( isset( $_GET ) && isset( $_GET['comment_status'] ) && isset( $_GET['delete_all'] ) && 'spam' == $_GET['comment_status'] )
+			return;	// Skip pings from mass spam delete.
 		if ( !array_key_exists( $type, $vaultpress_pings ) )
 			return;
 
